@@ -1,15 +1,17 @@
 import dbm
 from geopy.geocoders import Nominatim
 from datetime import datetime
-import functools
 import hashlib
 import json
 import logging
 from logging.handlers import RotatingFileHandler
 import os
 import PIL.Image
+from pymediainfo import MediaInfo
+import re
 import shutil
 import sys
+from wand.image import Image
 
 
 def setup_logger(log_file):
@@ -42,20 +44,6 @@ def setup_logger(log_file):
     logger.addHandler(console_handler)
 
     return logger
-
-
-def log_operation(func):
-    @functools.wraps(func)
-    def wrapper(*args, **kwargs):
-        logger.info(f"Starting '{func.__name__}' with args: {args}, kwargs: {kwargs}")
-        try:
-            result = func(*args, **kwargs)
-            logger.info(f"Completed '{func.__name__}' successfully with result: {result}")
-            return result
-        except Exception as e:
-            logger.error(f"Error in '{func.__name__}': {e}")
-            raise
-    return wrapper
 
 
 def get_coords(exif_data):
@@ -92,13 +80,13 @@ def get_timestamp(exif_data):
 
 def get_date(timestamp):
     if not timestamp:
-        return "Unknown"
+        return None
     return timestamp.strftime('%Y-%m-%d')
 
 
 def get_year(timestamp):
     if not timestamp:
-        return "Unknown"
+        return None
     return timestamp.strftime('%Y')
 
 
@@ -121,7 +109,9 @@ def get_location(coords):
     lookup = f"{house_number} {road}, {city}, {state}"
     if lookup in cfg.get("locations"):
         return cfg.get("locations").get(lookup)
-    return (f"{road}, {city}, {state}")
+    if road:
+        return (f"{road}, {city}, {state}")
+    return(f"{city}, {state}")
 
 
 def get_md5_hash(file_path, chunk_size=1048576):
@@ -140,31 +130,155 @@ def get_md5_hash(file_path, chunk_size=1048576):
     
     return md5.hexdigest()
 
-@log_operation
+
+def get_creation_timestamp(file_path):
+    try:
+        # Get the creation time
+        creation_time = os.path.getctime(file_path)
+        # Get the modification time
+        modification_time = os.path.getmtime(file_path)
+        
+        # Compare and get the earliest timestamp
+        earliest_timestamp = min(creation_time, modification_time)
+        
+        # Convert the earliest timestamp to a datetime object
+        timestamp = datetime.fromtimestamp(earliest_timestamp)
+        return timestamp
+    except Exception as e:
+        logger.error(e)
+        return None
+
+
+def get_media_info(file_path):
+    try:
+        media_info = MediaInfo.parse(file_path)
+        metadata = {
+            'creation_date': None,
+            'general': {},
+            'video': {},
+            'audio': {},
+            'image': {},
+            'menu': {}
+        }
+
+        for track in media_info.tracks:
+            if track.track_type == 'General':
+                metadata['general']['format'] = track.format
+                metadata['general']['file_size'] = track.file_size
+                metadata['general']['duration'] = track.duration
+                metadata['general']['bit_rate'] = track.overall_bit_rate
+                creation_date = track.encoded_date
+                if creation_date:
+                    date_str = creation_date.replace('UTC ', '')
+                    metadata['creation_date'] = datetime.strptime(date_str, '%Y-%m-%d %H:%M:%S')
+
+            elif track.track_type == 'Video':
+                metadata['video']['video_codec'] = track.codec_id
+                metadata['video']['width'] = track.width
+                metadata['video']['height'] = track.height
+                metadata['video']['frame_rate'] = track.frame_rate
+                metadata['video']['aspect_ratio'] = track.display_aspect_ratio
+                metadata['video']['bit_rate'] = track.bit_rate
+
+            elif track.track_type == 'Audio':
+                metadata['audio']['audio_codec'] = track.codec_id
+                metadata['audio']['sampling_rate'] = track.sampling_rate
+                metadata['audio']['channels'] = track.channel_s
+                metadata['audio']['bit_rate'] = track.bit_rate
+                metadata['audio']['language'] = track.language
+
+            elif track.track_type == 'Image':
+                metadata['image']['image_codec'] = track.codec_id
+                metadata['image']['image_width'] = track.width
+                metadata['image']['image_height'] = track.height
+
+            elif track.track_type == 'Menu':
+                metadata['menu']['menu_format'] = track.format
+
+            # Check for GPS data (if available)
+            if hasattr(track, 'latitude') and hasattr(track, 'longitude'):
+                metadata['gps_latitude'] = track.latitude
+                metadata['gps_longitude'] = track.longitude
+                if hasattr(track, 'altitude'):
+                    metadata['gps_altitude'] = track.altitude
+
+        return metadata
+    except Exception as e:
+        logger.error(e)
+        return None
+
+
+def convert_heic_to_jpeg(heic_file):
+    try:
+        # Extract directory path and filename without extension
+        directory = os.path.dirname(heic_file)
+        filename_no_ext = os.path.splitext(os.path.basename(heic_file))[0]
+
+        # Generate JPEG file path in the same directory
+        jpeg_file_path = os.path.join(directory, filename_no_ext + '.jpg')
+
+        # Use Wand to convert HEIC to JPEG
+        with Image(filename=heic_file) as img:
+            img.format = 'jpeg'
+            img.save(filename=jpeg_file_path)
+
+        return jpeg_file_path
+
+    except Exception as e:
+        logger.error(e)
+        return None
+
+
 def process_file(path):
     logger.debug(f"Processing file {path}")
+    exif_data = None
     try:
         img = PIL.Image.open(path)
+        exif_data = img._getexif()
     except PIL.UnidentifiedImageError:
-        logger.warning("Unknown image type, skipping")
-        return
+        filename = os.path.basename(path)
+        if filename in cfg.get("skip_files", []):
+            logger.debug(f"Skipping {filename} because it is in skip_files")
+            return
+        if filename.upper().endswith(".HEIC"):
+            logger.info(f"Converting {path} to JPEG")
+            path = convert_heic_to_jpeg(path)
+            if path:
+                process_file(path)
+            return
 
-    exif_data = img._getexif()
-    coords = get_coords(exif_data)
-    timestamp = get_timestamp(exif_data)
-    location = get_location(coords)
-    md5 = get_md5_hash(path)
+    # Get timestamp, date and year
+    timestamp = None
+    if exif_data:
+        timestamp = get_timestamp(exif_data)
+    else:
+        media_info = get_media_info(path)
+        timestamp = media_info.get("creation_date")
+
+    # If neither EXIF or media info is available, resort to using the creation timestamp
+    if not timestamp:
+        timestamp = get_creation_timestamp(path)
+
     date = get_date(timestamp)
     year = get_year(timestamp)
-
-    new_folder = f"{date} - {location}"
-    if date == "Unknown":
+    if not date:
         logger.warning("Unknown timestamp, skipping")
+        sys.exit()
         return
 
-    if location == "":
-        new_folder = f"{date}"
+    # Get location
+    location = None
+    if exif_data:
+        coords = get_coords(exif_data)
+        location = get_location(coords)
 
+    # Get hash
+    md5 = get_md5_hash(path)
+
+    new_folder = date
+    if location:
+        new_folder += f" - {location}"    
+    
     new_path = os.path.join(cfg.get("main_dir"), year, new_folder)
 
     try:
@@ -172,22 +286,23 @@ def process_file(path):
     except FileExistsError:
         pass
 
-    logger.debug(f"New path = {new_path}")
+    logger.info(f"Moving {path} to {new_path}")
     try:
         shutil.move(path, new_path)
     except Exception as e:
         logger.error(e)
+    sys.exit()
 
 
-def process_dir(folder):
+def process_dir(folder, recurse=True):
     logger.debug(f"Processing directory {folder}")
     files = os.listdir(folder)
 
     for file in files:
         path = os.path.join(folder, file)
-        if os.path.isdir(path):
+        if os.path.isdir(path) and recurse:
             process_dir(path)
-        else:
+        elif os.path.isfile(path):
             process_file(path)
 
 
@@ -201,7 +316,7 @@ with open("photodb.cfg.json", "r") as cfg_file:
 db = dbm.open("photos.gdbm", "c")
 
 folder = cfg.get("incoming_dir")
-process_dir(folder)
+process_dir(folder, recurse=False)
 
     
 
