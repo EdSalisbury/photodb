@@ -1,22 +1,27 @@
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import dbm
 from geopy.geocoders import Nominatim
 from datetime import datetime
+from functools import partial
 import hashlib
 import json
 import logging
 from logging.handlers import RotatingFileHandler
 import os
+from pathlib import Path
+import pickle
 import PIL.Image
 from pymediainfo import MediaInfo
 import re
 import shutil
 import sys
 from wand.image import Image
+import xxhash
 
 
 def setup_logger(log_file):
     """
-    Set up the logger to write to a file with rotation.
+    Set up the logger to write to a file with rotation and also log INFO and higher messages to the console.
 
     :param log_file: The path to the log file.
     :return: Configured logger.
@@ -24,19 +29,18 @@ def setup_logger(log_file):
     # Create a custom logger
     logger = logging.getLogger('photosdb')
     
-    # Set the logging level
-    logger.setLevel(logging.DEBUG)  # Change this to logging.INFO or another level if needed
+    # Set the logging level for the logger itself
+    logger.setLevel(logging.DEBUG)  # Capture all levels, control via handlers
 
-    # Create handlers
-    # File handler that writes to a file and rotates logs
+    # Create a file handler that writes to a file and rotates logs
     handler = RotatingFileHandler(log_file, maxBytes=5*1024*1024, backupCount=3)  # 5MB per file, keep 3 backups
-    
-    # Create a console handler if you also want to log to console
-    console_handler = logging.StreamHandler()
-
-    # Create formatters and add them to the handlers
+    handler.setLevel(logging.DEBUG)  # Capture all levels to file
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     handler.setFormatter(formatter)
+    
+    # Create a console handler to log INFO and higher messages to the console
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)  # Log INFO and higher to console
     console_handler.setFormatter(formatter)
 
     # Add the handlers to the logger
@@ -74,6 +78,9 @@ def get_timestamp(exif_data):
 
     creation_time_tag_id = 36867
     creation_time_str = exif_data.get(creation_time_tag_id)
+    if not creation_time_str:
+        return None
+    
     timestamp = datetime.strptime(creation_time_str, "%Y:%m:%d %H:%M:%S")
     return timestamp
 
@@ -92,7 +99,7 @@ def get_year(timestamp):
 
 def get_location(coords):
     if not coords:
-        return ""
+        return None
     loc = geo.reverse(f"{coords[0]},{coords[1]}")
     address = loc.raw.get("address", {})
     house_number = address.get("house_number")
@@ -114,21 +121,16 @@ def get_location(coords):
     return(f"{city}, {state}")
 
 
-def get_md5_hash(file_path, chunk_size=1048576):
-    """
-    Calculate the MD5 hash of a file.
-
-    :param file_path: Path to the file
-    :param chunk_size: Size of the chunk to read at a time. Default is 8192 bytes.
-    :return: MD5 hash of the file as a hexadecimal string
-    """
-    md5 = hashlib.md5()
-    
-    with open(file_path, 'rb') as f:
-        for chunk in iter(lambda: f.read(chunk_size), b''):
-            md5.update(chunk)
-    
-    return md5.hexdigest()
+def get_hash(file_path, chunk_size=8192):
+    """Generate xxhash of the specified file."""
+    hasher = xxhash.xxh64()
+    try:
+        with open(file_path, 'rb') as f:
+            while chunk := f.read(chunk_size):
+                hasher.update(chunk)
+    except Exception as e:
+        return None
+    return hasher.hexdigest()
 
 
 def get_creation_timestamp(file_path):
@@ -229,7 +231,43 @@ def convert_heic_to_jpeg(heic_file):
         return None
 
 
-def process_file(path):
+def generate_unique_filename(file_path):
+    if not os.path.exists(file_path):
+        return file_path  # If file doesn't exist, no collision, return original path
+    
+    file_name, file_ext = os.path.splitext(file_path)
+    counter = 1
+    
+    while True:
+        new_file_path = f"{file_name}_{counter:03d}{file_ext}"
+        if not os.path.exists(new_file_path):
+            return new_file_path  # Return the new path if it doesn't exist
+        
+        counter += 1
+
+
+def move_file(path, new_path):
+    new_path = generate_unique_filename(new_path)
+
+    logger.info(f"Moving {path} to {new_path}")
+
+    folder = os.path.dirname(new_path)
+    os.makedirs(folder, exist_ok=True)
+    
+    try:
+        shutil.move(path, new_path)
+    except Exception as e:
+        logger.error(e)
+    return True
+
+
+def move_to_duplicate(path):
+    stripped_path = path.lstrip(cfg.get("main_dir"))
+    new_path = os.path.join(cfg.get("duplicate_dir"), stripped_path)
+    return move_file(path, new_path)
+    
+
+def process_file(path, import_files=False, move_duplicates=False):
     logger.debug(f"Processing file {path}")
     exif_data = None
     try:
@@ -241,10 +279,12 @@ def process_file(path):
             logger.debug(f"Skipping {filename} because it is in skip_files")
             return
         if filename.upper().endswith(".HEIC"):
-            logger.info(f"Converting {path} to JPEG")
-            path = convert_heic_to_jpeg(path)
-            if path:
-                process_file(path)
+            if import_files:
+                logger.info(f"Converting {path} to JPEG")
+                jpeg_path = convert_heic_to_jpeg(path)
+                if jpeg_path:
+                    if (process_file(jpeg_path)):
+                        return move_to_duplicate(path)
             return
 
     # Get timestamp, date and year
@@ -263,47 +303,101 @@ def process_file(path):
     year = get_year(timestamp)
     if not date:
         logger.warning("Unknown timestamp, skipping")
-        sys.exit()
         return
 
     # Get location
+    coords = None
     location = None
     if exif_data:
         coords = get_coords(exif_data)
         location = get_location(coords)
 
     # Get hash
-    md5 = get_md5_hash(path)
+    hash = get_hash(path)
 
     new_folder = date
     if location:
         new_folder += f" - {location}"    
     
-    new_path = os.path.join(cfg.get("main_dir"), year, new_folder)
+    filename = os.path.basename(path)
+    new_path = os.path.join(cfg.get("main_dir"), year, new_folder, filename)
+    
+    stripped_path = path.lstrip(cfg.get("main_dir"))
 
-    try:
-        os.makedirs(new_path)
-    except FileExistsError:
-        pass
+    obj = {
+        "filename": stripped_path,
+        "coords": coords,
+        "location": location,
+        "date": date
+    }
+    
+    db_obj = load_value(hash)
+    if db_obj:
+        full_path = os.path.join(cfg.get("main_dir"), db_obj.get("filename"))
+        if not os.path.isfile(full_path):
+            logger.debug(f"Deleting record for {full_path}")
+            delete_value(hash)
+            db_obj = None
+    
+    if db_obj:
+        if stripped_path == db_obj.get("filename"):
+            logger.debug(f"Updating record for {stripped_path}")
+            save_value(hash, obj, overwrite=True)
+        else:
+            logger.warning(f"Duplicate found for {hash} ({stripped_path})")
+            if move_duplicates:
+                return move_to_duplicate(path)
+    else:
+        logger.debug(f"Creating record for {stripped_path}")
+        save_value(hash, obj, overwrite=False)
 
-    logger.info(f"Moving {path} to {new_path}")
-    try:
-        shutil.move(path, new_path)
-    except Exception as e:
-        logger.error(e)
-    sys.exit()
+    if import_files:
+        return move_file(path, new_path)
 
-
-def process_dir(folder, recurse=True):
+def process_dir(folder, max_workers=4, recurse=True, import_files=False, move_duplicates=False):
     logger.debug(f"Processing directory {folder}")
-    files = os.listdir(folder)
-
-    for file in files:
+    paths = os.listdir(folder)
+    files = list()
+    dirs = list()
+    for file in paths:
         path = os.path.join(folder, file)
-        if os.path.isdir(path) and recurse:
-            process_dir(path)
-        elif os.path.isfile(path):
-            process_file(path)
+        if os.path.isfile(path):
+            files.append(path)
+        elif os.path.isdir(path):
+            dirs.append(path)
+
+    if recurse:
+        for folder in dirs:
+            process_dir(folder, max_workers, recurse, import_files, move_duplicates)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        partial_process_file = partial(process_file, import_files=import_files, move_duplicates=move_duplicates)
+        futures = [executor.submit(partial_process_file, file) for file in files]
+        
+        for future in as_completed(futures):
+            future.result()  # Wait for each future to complete
+    
+    logger.debug(f"Completed processing directory {folder}")
+
+
+def save_value(key, value, overwrite=True):
+    serialized = pickle.dumps(value)
+    if key in db and not overwrite:
+        return False
+    db[key] = serialized
+    return True
+
+
+def load_value(key):
+    try:
+        serialized = db[key]
+        return pickle.loads(serialized)
+    except KeyError:
+        return None
+
+
+def delete_value(key):
+    del db[key]
 
 
 logger = setup_logger("photodb.log")
@@ -315,12 +409,41 @@ with open("photodb.cfg.json", "r") as cfg_file:
 
 db = dbm.open("photos.gdbm", "c")
 
-folder = cfg.get("incoming_dir")
-process_dir(folder, recurse=False)
+# previous_dir_state = load_value("dir_state")
+# if not previous_dir_state:
+#     previous_dir_state = dict()
 
-    
+# current_dir_state = get_directory_state(cfg.get("main_dir"))
+# added, modified, deleted = detect_dir_changes(previous_dir_state, current_dir_state)
+
+# for folder in added:
+#     print(f"added {folder}")
+#     process_dir(folder, recurse=True, import_files=False, move_duplicates=True)
+
+# for folder in modified:
+#     print(f"modified {folder}")
+#     process_dir(folder, recurse=True, import_files=False, move_duplicates=True)
+
+# save_value("dir_state", current_dir_state)
 
 
+# Import process
+#folder = cfg.get("incoming_dir")
+#process_dir(folder, recurse=True)
 
+# Update process
+# Open main_dir
+main_dir = cfg.get("main_dir")
+process_dir(main_dir, max_workers=4, recurse=True, import_files=False, move_duplicates=True)
+
+# for key in db.keys():
+#     print(f"{key} = {pickle.loads(db[key])}")
+
+# Go through the files
+# Get metadata
+# Get md5
+# Store all of the above in the database
+# If there's already an entry:
+  # exit
 
 
