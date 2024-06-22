@@ -1,4 +1,5 @@
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import argparse
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import dbm
 from geopy.geocoders import Nominatim
 from datetime import datetime
@@ -12,10 +13,11 @@ from pathlib import Path
 import pickle
 import PIL.Image
 from pymediainfo import MediaInfo
+from ratelimit import limits, sleep_and_retry
 import re
 import shutil
 import sys
-from wand.image import Image
+#from wand.image import Image
 import xxhash
 
 
@@ -35,19 +37,48 @@ def setup_logger(log_file):
     # Create a file handler that writes to a file and rotates logs
     handler = RotatingFileHandler(log_file, maxBytes=5*1024*1024, backupCount=3)  # 5MB per file, keep 3 backups
     handler.setLevel(logging.DEBUG)  # Capture all levels to file
-    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
     handler.setFormatter(formatter)
     
     # Create a console handler to log INFO and higher messages to the console
     console_handler = logging.StreamHandler()
     console_handler.setLevel(logging.INFO)  # Log INFO and higher to console
-    console_handler.setFormatter(formatter)
+    console_formatter = logging.Formatter('%(levelname)s - %(message)s')
+    console_handler.setFormatter(console_formatter)
 
     # Add the handlers to the logger
     logger.addHandler(handler)
     logger.addHandler(console_handler)
 
     return logger
+
+
+def parse_arguments():
+    """
+    Parse command line arguments.
+
+    :return: Namespace with parsed arguments.
+    """
+    parser = argparse.ArgumentParser(description="Process files with various options.")
+
+    parser.add_argument(
+        '--move-duplicates',
+        action='store_true',
+        help='Move duplicate files to a specified directory.'
+    )
+    parser.add_argument(
+        '--import',
+        type=str,
+        help='Path to import photos from.'
+    )
+    parser.add_argument(
+        '--max-workers',
+        type=int,
+        default=4,
+        help='Maximum number of worker threads to use for processing files. Default is 4.'
+    )
+
+    return parser.parse_args()
 
 
 def get_coords(exif_data):
@@ -97,11 +128,63 @@ def get_year(timestamp):
     return timestamp.strftime('%Y')
 
 
+def round_coordinates(coordinate_tuple, precision=4):
+    """
+    Round the coordinates in the tuple to a specified precision.
+
+    :param coordinate_tuple: A tuple of coordinates (e.g., (x, y)).
+    :param precision: Number of decimal places to round to.
+    :return: A new tuple with rounded coordinates.
+    """
+    return tuple(round(coord, precision) for coord in coordinate_tuple)
+
+
+def tuple_to_dbm_key(coordinate_tuple, precision=4):
+    """
+    Convert a rounded coordinate tuple to a suitable key for dbm.
+
+    :param coordinate_tuple: A tuple of coordinates (e.g., (x, y)).
+    :param precision: Number of decimal places to round to before converting to key.
+    :return: Encoded byte string suitable for dbm keys.
+    """
+    # Round the coordinates
+    rounded_tuple = round_coordinates(coordinate_tuple, precision)
+    
+    # Convert tuple to string
+    tuple_str = str(rounded_tuple)
+    
+    # Encode the string to bytes
+    key_bytes = tuple_str.encode('utf-8')
+    
+    return key_bytes
+
+
+@sleep_and_retry
+@limits(calls=1, period=1)
 def get_location(coords):
+    logger.debug(f"Getting location for {coords}")
+    try:
+        loc = geo.reverse(f"{coords[0]},{coords[1]}")
+        return loc.raw.get("address", {})
+    except Exception:
+        return dict()
+
+
+def get_address(coords):
     if not coords:
         return None
-    loc = geo.reverse(f"{coords[0]},{coords[1]}")
-    address = loc.raw.get("address", {})
+    
+    coords = round_coordinates(coords)
+    key = tuple_to_dbm_key(coords)
+    address = load_value(key)
+    if not address:
+        address = dict()
+        try:
+            address = get_location(coords)
+            save_value(key, address)
+        except Exception:
+            pass
+
     house_number = address.get("house_number")
     road = address.get("road")
     city = address.get("city")
@@ -110,7 +193,7 @@ def get_location(coords):
     if not city:
         city = address.get("county")
 
-    state = address.get("ISO3166-2-lvl4")
+    state = address.get("ISO3166-2-lvl4", "")
     if state.startswith("US-"):
         state = state[3:]
     lookup = f"{house_number} {road}, {city}, {state}"
@@ -119,18 +202,6 @@ def get_location(coords):
     if road:
         return (f"{road}, {city}, {state}")
     return(f"{city}, {state}")
-
-
-def get_hash(file_path, chunk_size=8192):
-    """Generate xxhash of the specified file."""
-    hasher = xxhash.xxh64()
-    try:
-        with open(file_path, 'rb') as f:
-            while chunk := f.read(chunk_size):
-                hasher.update(chunk)
-    except Exception as e:
-        return None
-    return hasher.hexdigest()
 
 
 def get_creation_timestamp(file_path):
@@ -265,27 +336,17 @@ def move_to_duplicate(path):
     stripped_path = path.lstrip(cfg.get("main_dir"))
     new_path = os.path.join(cfg.get("duplicate_dir"), stripped_path)
     return move_file(path, new_path)
-    
 
-def process_file(path, import_files=False, move_duplicates=False):
-    logger.debug(f"Processing file {path}")
+
+def get_metadata(path):
     exif_data = None
     try:
         img = PIL.Image.open(path)
         exif_data = img._getexif()
     except PIL.UnidentifiedImageError:
-        filename = os.path.basename(path)
-        if filename in cfg.get("skip_files", []):
-            logger.debug(f"Skipping {filename} because it is in skip_files")
-            return
-        if filename.upper().endswith(".HEIC"):
-            if import_files:
-                logger.info(f"Converting {path} to JPEG")
-                jpeg_path = convert_heic_to_jpeg(path)
-                if jpeg_path:
-                    if (process_file(jpeg_path)):
-                        return move_to_duplicate(path)
-            return
+        pass
+    except AttributeError:
+        pass
 
     # Get timestamp, date and year
     timestamp = None
@@ -301,61 +362,54 @@ def process_file(path, import_files=False, move_duplicates=False):
 
     date = get_date(timestamp)
     year = get_year(timestamp)
-    if not date:
-        logger.warning("Unknown timestamp, skipping")
-        return
-
+    
     # Get location
     coords = None
-    location = None
+    address = None
     if exif_data:
         coords = get_coords(exif_data)
-        location = get_location(coords)
+        address = get_address(coords)
 
-    # Get hash
-    hash = get_hash(path)
-
-    new_folder = date
-    if location:
-        new_folder += f" - {location}"    
-    
-    filename = os.path.basename(path)
-    new_path = os.path.join(cfg.get("main_dir"), year, new_folder, filename)
-    
-    stripped_path = path.lstrip(cfg.get("main_dir"))
-
-    obj = {
-        "filename": stripped_path,
+    return {
+        "path": path,
         "coords": coords,
-        "location": location,
-        "date": date
+        "location": address,
+        "date": date,
+        "year": year
     }
-    
-    db_obj = load_value(hash)
-    if db_obj:
-        full_path = os.path.join(cfg.get("main_dir"), db_obj.get("filename"))
-        if not os.path.isfile(full_path):
-            logger.debug(f"Deleting record for {full_path}")
-            delete_value(hash)
-            db_obj = None
-    
-    if db_obj:
-        if stripped_path == db_obj.get("filename"):
-            logger.debug(f"Updating record for {stripped_path}")
-            save_value(hash, obj, overwrite=True)
-        else:
-            logger.warning(f"Duplicate found for {hash} ({stripped_path})")
-            if move_duplicates:
+
+#1048576
+def get_hash(file_path, chunk_size=65536):
+    """Generate xxhash of the specified file."""
+    #hasher = xxhash.xxh64()
+    hasher = xxhash.xxh3_64()
+    try:
+        with open(file_path, 'rb') as f:
+            while chunk := f.read(chunk_size):
+                hasher.update(chunk)
+    except Exception as e:
+        return None
+    return hasher.hexdigest()
+
+def process_file(path, move_duplicates=False):
+    logger.debug(f"Processing file {path}")
+    hash = get_hash(path)
+    db_path = load_value(hash)
+    if db_path:
+        logger.debug(f"Record found for {path} ({hash})")
+        if os.path.isfile(db_path):
+            if path != db_path and move_duplicates:
                 return move_to_duplicate(path)
+        else:
+            logger.debug(f"Replacing record for {db_path}")
+            return save_value(hash, path)
     else:
-        logger.debug(f"Creating record for {stripped_path}")
-        save_value(hash, obj, overwrite=False)
+        logger.debug(f"Adding record for {path}")
+        return save_value(hash, path)   
 
-    if import_files:
-        return move_file(path, new_path)
 
-def process_dir(folder, max_workers=4, recurse=True, import_files=False, move_duplicates=False):
-    logger.debug(f"Processing directory {folder}")
+def process_dir(folder, max_workers=4, move_duplicates=False):
+    logger.info(f"Processing directory {folder}")
     paths = os.listdir(folder)
     files = list()
     dirs = list()
@@ -366,26 +420,29 @@ def process_dir(folder, max_workers=4, recurse=True, import_files=False, move_du
         elif os.path.isdir(path):
             dirs.append(path)
 
-    if recurse:
-        for folder in dirs:
-            process_dir(folder, max_workers, recurse, import_files, move_duplicates)
+    for folder in dirs:
+        process_dir(folder, max_workers=max_workers, move_duplicates=move_duplicates)
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        partial_process_file = partial(process_file, import_files=import_files, move_duplicates=move_duplicates)
-        futures = [executor.submit(partial_process_file, file) for file in files]
-        
-        for future in as_completed(futures):
-            future.result()  # Wait for each future to complete
-    
+    mtime = os.path.getmtime(folder)
+    last_modified = load_value(folder)
+    if not last_modified or mtime > last_modified:
+        logger.debug(f"Processing files in {folder}")
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            partial_process_file = partial(process_file, move_duplicates=move_duplicates)
+            futures = [executor.submit(partial_process_file, file) for file in files]
+            
+            for future in as_completed(futures):
+                future.result()  # Wait for each future to complete
+        save_value(folder, mtime)
     logger.debug(f"Completed processing directory {folder}")
 
 
-def save_value(key, value, overwrite=True):
-    serialized = pickle.dumps(value)
-    if key in db and not overwrite:
+def save_value(key, value):
+    try:
+        db[key] = pickle.dumps(value)
+        return True
+    except Exception:
         return False
-    db[key] = serialized
-    return True
 
 
 def load_value(key):
@@ -401,49 +458,11 @@ def delete_value(key):
 
 
 logger = setup_logger("photodb.log")
-
 geo = Nominatim(user_agent="PhotoDB")
-
 with open("photodb.cfg.json", "r") as cfg_file:
     cfg = json.load(cfg_file)
-
 db = dbm.open("photos.gdbm", "c")
-
-# previous_dir_state = load_value("dir_state")
-# if not previous_dir_state:
-#     previous_dir_state = dict()
-
-# current_dir_state = get_directory_state(cfg.get("main_dir"))
-# added, modified, deleted = detect_dir_changes(previous_dir_state, current_dir_state)
-
-# for folder in added:
-#     print(f"added {folder}")
-#     process_dir(folder, recurse=True, import_files=False, move_duplicates=True)
-
-# for folder in modified:
-#     print(f"modified {folder}")
-#     process_dir(folder, recurse=True, import_files=False, move_duplicates=True)
-
-# save_value("dir_state", current_dir_state)
-
-
-# Import process
-#folder = cfg.get("incoming_dir")
-#process_dir(folder, recurse=True)
-
-# Update process
-# Open main_dir
+args = parse_arguments()
 main_dir = cfg.get("main_dir")
-process_dir(main_dir, max_workers=4, recurse=True, import_files=False, move_duplicates=True)
 
-# for key in db.keys():
-#     print(f"{key} = {pickle.loads(db[key])}")
-
-# Go through the files
-# Get metadata
-# Get md5
-# Store all of the above in the database
-# If there's already an entry:
-  # exit
-
-
+process_dir(main_dir, max_workers=args.max_workers, move_duplicates=args.move_duplicates)
