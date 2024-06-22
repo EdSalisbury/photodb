@@ -1,3 +1,4 @@
 photodb.cfg.json
 photos.gdbm
 *.log
+*.pyc

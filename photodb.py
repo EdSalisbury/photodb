@@ -1,5 +1,6 @@
 import argparse
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from dbmwrapper import DBMWrapper
 import dbm
 from geopy.geocoders import Nominatim
 from datetime import datetime
@@ -7,7 +8,6 @@ from functools import partial
 import hashlib
 import json
 import logging
-from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
 import pickle
@@ -17,11 +17,12 @@ from ratelimit import limits, sleep_and_retry
 import re
 import shutil
 import sys
+import traceback
 #from wand.image import Image
 import xxhash
 
 
-def setup_logger(log_file):
+def setup_logger():
     """
     Set up the logger to write to a file with rotation and also log INFO and higher messages to the console.
 
@@ -31,18 +32,21 @@ def setup_logger(log_file):
     # Create a custom logger
     logger = logging.getLogger('photosdb')
     
+    timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    log_file = f"photosdb_{timestamp}.log"
+    console_log_level = os.getenv('LOG_LEVEL', 'INFO').upper()
+
     # Set the logging level for the logger itself
     logger.setLevel(logging.DEBUG)  # Capture all levels, control via handlers
 
-    # Create a file handler that writes to a file and rotates logs
-    handler = RotatingFileHandler(log_file, maxBytes=5*1024*1024, backupCount=3)  # 5MB per file, keep 3 backups
+    handler = logging.FileHandler(log_file)
     handler.setLevel(logging.DEBUG)  # Capture all levels to file
     formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
     handler.setFormatter(formatter)
     
     # Create a console handler to log INFO and higher messages to the console
     console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)  # Log INFO and higher to console
+    console_handler.setLevel(console_log_level)  # Log INFO and higher to console
     console_formatter = logging.Formatter('%(levelname)s - %(message)s')
     console_handler.setFormatter(console_formatter)
 
@@ -176,12 +180,12 @@ def get_address(coords):
     
     coords = round_coordinates(coords)
     key = tuple_to_dbm_key(coords)
-    address = load_value(key)
+    address = db.load_value(key)
     if not address:
         address = dict()
         try:
             address = get_location(coords)
-            save_value(key, address)
+            db.save_value(key, address)
         except Exception:
             pass
 
@@ -378,10 +382,9 @@ def get_metadata(path):
         "year": year
     }
 
-#1048576
+
 def get_hash(file_path, chunk_size=65536):
     """Generate xxhash of the specified file."""
-    #hasher = xxhash.xxh64()
     hasher = xxhash.xxh3_64()
     try:
         with open(file_path, 'rb') as f:
@@ -391,25 +394,36 @@ def get_hash(file_path, chunk_size=65536):
         return None
     return hasher.hexdigest()
 
+
 def process_file(path, move_duplicates=False):
-    logger.debug(f"Processing file {path}")
-    hash = get_hash(path)
-    db_path = load_value(hash)
-    if db_path:
-        logger.debug(f"Record found for {path} ({hash})")
-        if os.path.isfile(db_path):
-            if path != db_path and move_duplicates:
-                return move_to_duplicate(path)
+    try:
+        logger.debug(f"Processing file {path}")
+        hash = get_hash(path)
+        db_path = db.load_value(hash)
+        if db_path:
+            logger.debug(f"Record found for {path} ({hash})")
+            if os.path.isfile(db_path):
+                if path != db_path:
+                    logger.debug(f"Duplicate detected for {path} (original is {db_path})")
+                    if move_duplicates:
+                        return move_to_duplicate(path)
+            else:
+                logger.debug(f"Replacing record for {db_path} ({hash})")
+                return db.save_value(hash, path)
         else:
-            logger.debug(f"Replacing record for {db_path}")
-            return save_value(hash, path)
-    else:
-        logger.debug(f"Adding record for {path}")
-        return save_value(hash, path)   
+            logger.debug(f"Adding record for {path} ({hash})")
+            return db.save_value(hash, path)
+        logger.debug("Got here")
+        sys.exit()
+    except Exception as e:
+        logger.error(f"Error processing {path}: {e}")
+        logger.error(traceback.format_exc())  # Log the full traceback for debugging
+        return False
+   
 
 
 def process_dir(folder, max_workers=4, move_duplicates=False):
-    logger.info(f"Processing directory {folder}")
+    logger.info(f"Analyzing directory {folder}.")
     paths = os.listdir(folder)
     files = list()
     dirs = list()
@@ -424,45 +438,36 @@ def process_dir(folder, max_workers=4, move_duplicates=False):
         process_dir(folder, max_workers=max_workers, move_duplicates=move_duplicates)
 
     mtime = os.path.getmtime(folder)
-    last_modified = load_value(folder)
-    if not last_modified or mtime > last_modified:
-        logger.debug(f"Processing files in {folder}")
+    last_modified = db.load_value(folder)
+    if not last_modified or mtime > float(last_modified):
+        logger.debug(f"Processing files in {folder}.")
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
             partial_process_file = partial(process_file, move_duplicates=move_duplicates)
             futures = [executor.submit(partial_process_file, file) for file in files]
             
             for future in as_completed(futures):
-                future.result()  # Wait for each future to complete
-        save_value(folder, mtime)
-    logger.debug(f"Completed processing directory {folder}")
+                try:
+                    result = future.result()  # Wait for each future to complete
+                    if not result:
+                        logger.error(f"Processing failed for file: {future.exception()}")
+                except Exception as e:
+                    logger.error(f"Error processing file: {e}")
+                    logger.error(traceback.format_exc())
+
+        db.save_value(folder, str(mtime))
+        logger.debug(f"Completed processing directory {folder}.")
+    else:
+        logger.debug(f"Skipping processing for {folder}.")
+
+    
 
 
-def save_value(key, value):
-    try:
-        db[key] = pickle.dumps(value)
-        return True
-    except Exception:
-        return False
-
-
-def load_value(key):
-    try:
-        serialized = db[key]
-        return pickle.loads(serialized)
-    except KeyError:
-        return None
-
-
-def delete_value(key):
-    del db[key]
-
-
-logger = setup_logger("photodb.log")
+logger = setup_logger()
 geo = Nominatim(user_agent="PhotoDB")
 with open("photodb.cfg.json", "r") as cfg_file:
     cfg = json.load(cfg_file)
-db = dbm.open("photos.gdbm", "c")
 args = parse_arguments()
 main_dir = cfg.get("main_dir")
 
-process_dir(main_dir, max_workers=args.max_workers, move_duplicates=args.move_duplicates)
+with DBMWrapper("photos.gdbm", logger=logger) as db:
+    process_dir(main_dir, max_workers=args.max_workers, move_duplicates=args.move_duplicates)
