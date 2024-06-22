@@ -1,5 +1,5 @@
 import argparse
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dbmwrapper import DBMWrapper
 import dbm
 from geopy.geocoders import Nominatim
@@ -17,6 +17,7 @@ from ratelimit import limits, sleep_and_retry
 import re
 import shutil
 import sys
+import threading
 import traceback
 #from wand.image import Image
 import xxhash
@@ -397,23 +398,41 @@ def get_hash(file_path, chunk_size=65536):
 
 def process_file(path, move_duplicates=False):
     try:
-        logger.debug(f"Processing file {path}")
+        thread_id = threading.get_ident()
+
+        # Skip files
+        filename = os.path.basename(path)
+        if filename in cfg.get("skip_files"):
+            logger.debug(f"{thread_id}: Skipping {path}")
+            return True
+        
+        logger.debug(f"{thread_id}: Processing file {path}")
         hash = get_hash(path)
+        #logger.debug(f"{thread_id}: path = {path}, hash = {hash}")
         db_path = db.load_value(hash)
+        #logger.debug(f"{thread_id}: path = {path}, db_path = {db_path}")
         if db_path:
-            logger.debug(f"Record found for {path} ({hash})")
+            logger.debug(f"{thread_id}: Record found for {path} ({hash})")
             if os.path.isfile(db_path):
-                if path != db_path:
-                    logger.debug(f"Duplicate detected for {path} (original is {db_path})")
+                if path == db_path:
+                    return True
+                else:
+                    logger.debug(f"{thread_id}: Duplicate detected for {path} (original is {db_path})")
                     if move_duplicates:
                         return move_to_duplicate(path)
+                    else:
+                        return True
             else:
-                logger.debug(f"Replacing record for {db_path} ({hash})")
+                logger.debug(f"{thread_id}: Replacing record for {db_path} ({hash})")
                 return db.save_value(hash, path)
         else:
-            logger.debug(f"Adding record for {path} ({hash})")
+            logger.debug(f"{thread_id}: Adding record for {path} ({hash})")
             return db.save_value(hash, path)
-        logger.debug("Got here")
+            #db.save_value(hash, path)
+            #logger.debug(f"{thread_id}: ABORT")
+            #sys.exit()
+            #return db.save_value(hash, path)
+        #logger.debug("{thread_id}: Got here")
         sys.exit()
     except Exception as e:
         logger.error(f"Error processing {path}: {e}")
@@ -436,12 +455,17 @@ def process_dir(folder, max_workers=4, move_duplicates=False):
 
     for folder in dirs:
         process_dir(folder, max_workers=max_workers, move_duplicates=move_duplicates)
+        #sys.exit()
 
     mtime = os.path.getmtime(folder)
     last_modified = db.load_value(folder)
+    #last_modified = None
     if not last_modified or mtime > float(last_modified):
-        logger.debug(f"Processing files in {folder}.")
-        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        logger.info(f"Processing files in {folder}.")
+        #for file in files:
+        #    process_file(file, move_duplicates=move_duplicates)
+        #logger.debug(f"Max workers = {max_workers}")
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
             partial_process_file = partial(process_file, move_duplicates=move_duplicates)
             futures = [executor.submit(partial_process_file, file) for file in files]
             
@@ -455,7 +479,7 @@ def process_dir(folder, max_workers=4, move_duplicates=False):
                     logger.error(traceback.format_exc())
 
         db.save_value(folder, str(mtime))
-        logger.debug(f"Completed processing directory {folder}.")
+        logger.info(f"Completed processing directory {folder}.")
     else:
         logger.debug(f"Skipping processing for {folder}.")
 
@@ -469,5 +493,20 @@ with open("photodb.cfg.json", "r") as cfg_file:
 args = parse_arguments()
 main_dir = cfg.get("main_dir")
 
+import time
+
 with DBMWrapper("photos.gdbm", logger=logger) as db:
     process_dir(main_dir, max_workers=args.max_workers, move_duplicates=args.move_duplicates)
+    # counter = 1
+    # while True:
+    #     print(f"counter = {counter}")
+    #     for i in range(10000 * counter, 10000 * counter + 10000):
+    #         db.save_value(f"key_{i}", str(i))
+    #     time.sleep(1)
+    #     for i in range(10000 * counter, 10000 * counter + 10000):
+    #         key = f"key_{i}"
+    #         value = db.load_value(key)
+    #         if not value:
+    #             print(f"Value not found for {key}")
+    #             sys.exit()
+    #     counter += 1

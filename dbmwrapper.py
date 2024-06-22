@@ -43,6 +43,7 @@ class DBMWrapper:
                 return None
 
     def save_value(self, key, value):
+        #self.logger.debug(f"Saving {key} = {value}")
         with self.lock:
             try:
                 serialized_key = self._serialize(key)
