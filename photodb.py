@@ -14,6 +14,7 @@ from ratelimit import limits, sleep_and_retry
 import re
 import shutil
 import sys
+import tempfile
 import traceback
 from wand.image import Image
 import xxhash
@@ -68,9 +69,9 @@ def parse_arguments():
         help='Move duplicate files to a specified directory.'
     )
     parser.add_argument(
-        '--import',
+        '--import-files',
         type=str,
-        help='Path to import photos from.'
+        help='Path to import media from.'
     )
     parser.add_argument(
         '--max-workers',
@@ -129,7 +130,7 @@ def get_year(timestamp):
     return timestamp.strftime('%Y')
 
 
-def round_coordinates(coordinate_tuple, precision=4):
+def round_coordinates(coordinate_tuple, precision=6):
     """
     Round the coordinates in the tuple to a specified precision.
 
@@ -140,7 +141,7 @@ def round_coordinates(coordinate_tuple, precision=4):
     return tuple(round(coord, precision) for coord in coordinate_tuple)
 
 
-def tuple_to_dbm_key(coordinate_tuple, precision=4):
+def tuple_to_dbm_key(coordinate_tuple, precision=6):
     """
     Convert a rounded coordinate tuple to a suitable key for dbm.
 
@@ -161,9 +162,9 @@ def tuple_to_dbm_key(coordinate_tuple, precision=4):
 
 
 @sleep_and_retry
-@limits(calls=1, period=1)
+@limits(calls=1, period=5)
 def get_location(coords):
-    logger.debug(f"Getting location for {coords}")
+    logger.info(f"Getting location for {coords}")
     try:
         loc = geo.reverse(f"{coords[0]},{coords[1]}")
         return loc.raw.get("address", {})
@@ -178,6 +179,7 @@ def get_address(coords):
     coords = round_coordinates(coords)
     key = tuple_to_dbm_key(coords)
     address = db.load_value(key)
+
     if not address:
         address = dict()
         try:
@@ -288,8 +290,9 @@ def convert_heic_to_jpeg(heic_file):
         directory = os.path.dirname(heic_file)
         filename_no_ext = os.path.splitext(os.path.basename(heic_file))[0]
 
-        # Generate JPEG file path in the same directory
-        jpeg_file_path = os.path.join(directory, filename_no_ext + '.jpg')
+        # Generate JPEG file path in a temp dir
+        temp_dir = tempfile.mkdtemp()
+        jpeg_file_path = os.path.join(temp_dir, filename_no_ext + '.jpg')
 
         # Use Wand to convert HEIC to JPEG
         with Image(filename=heic_file) as img:
@@ -300,6 +303,7 @@ def convert_heic_to_jpeg(heic_file):
 
     except Exception as e:
         logger.error(e)
+        sys.exit(1)
         return None
 
 
@@ -426,7 +430,66 @@ def process_file(path, move_duplicates=False):
         return False
 
 
-def process_dir(folder, max_workers=4, move_duplicates=False):
+def copy_file(path):
+    metadata = get_metadata(path)
+    
+    new_folder = metadata.get("date")
+    if metadata.get("location"):
+        new_folder += f" - {metadata.get('location')}"    
+    
+    filename = os.path.basename(path)
+    new_path = os.path.join(cfg.get("main_dir"), metadata.get('year'), new_folder, filename)    
+    new_path = generate_unique_filename(new_path)
+
+    folder = os.path.dirname(new_path)
+
+    os.makedirs(folder, exist_ok=True)
+
+    logger.info(f"Copying {path} to {new_path}")
+    try:
+        shutil.copy(path, new_path)
+        return new_path
+    except Exception as e:
+        logger.error(e)
+        return None
+
+
+def import_file(path):
+    try:
+        # Skip files
+        filename = os.path.basename(path)
+        if filename in cfg.get("skip_files"):
+            logger.debug(f"Skipping {path}")
+            return True
+        
+        # Convert HEIC to JPEG
+        if filename.upper().endswith(".HEIC"):
+            logger.info(f"Converting {path} to JPEG")
+            path = convert_heic_to_jpeg(path)
+            if path:
+                return import_file(path)
+            else:
+                return True
+
+        logger.debug(f"Analyzing file {path}")
+        hash = get_hash(path)
+        db_path = db.load_value(hash)
+        if db_path and os.path.isfile(db_path):
+            logger.info(f"File has already been imported {path} ({hash}) {db_path}")
+            return True
+        else:
+            logger.info(f"Importing file {path} ({hash})")
+            new_path = copy_file(path)
+            #db.save_value(hash, new_path)
+            #sys.exit()
+            return db.save_value(hash, new_path)
+    except Exception as e:
+        logger.error(f"Error processing {path}: {e}")
+        logger.error(traceback.format_exc())  # Log the full traceback for debugging
+        return False
+    
+
+def process_dir(folder, max_workers=4, import_files=False, move_duplicates=False):
     logger.info(f"Analyzing directory {folder}.")
     paths = os.listdir(folder)
     files = list()
@@ -439,14 +502,18 @@ def process_dir(folder, max_workers=4, move_duplicates=False):
             dirs.append(path)
 
     for folder in dirs:
-        process_dir(folder, max_workers=max_workers, move_duplicates=move_duplicates)
+        process_dir(folder, max_workers=max_workers, import_files=import_files, move_duplicates=move_duplicates)
 
     mtime = os.path.getmtime(folder)
     last_modified = db.load_value(folder)
-    if not last_modified or mtime > float(last_modified):
+    if import_files or not last_modified or mtime > float(last_modified):
         logger.info(f"Processing files in {folder}.")
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            partial_process_file = partial(process_file, move_duplicates=move_duplicates)
+            if import_files:
+                partial_process_file = partial(import_file)
+            else:
+                partial_process_file = partial(process_file, import_files=import_files, move_duplicates=move_duplicates)
+            
             futures = [executor.submit(partial_process_file, file) for file in files]
             
             for future in as_completed(futures):
@@ -472,4 +539,7 @@ args = parse_arguments()
 main_dir = cfg.get("main_dir")
 
 with DBMWrapper("photos.gdbm", logger=logger) as db:
-    process_dir(main_dir, max_workers=args.max_workers, move_duplicates=args.move_duplicates)
+    if args.import_files:
+        process_dir(args.import_files, max_workers=args.max_workers, import_files=True)
+    else:
+        process_dir(cfg.get("main_dir"), max_workers=args.max_workers, import_files=False, move_duplicates=args.move_duplicates)
